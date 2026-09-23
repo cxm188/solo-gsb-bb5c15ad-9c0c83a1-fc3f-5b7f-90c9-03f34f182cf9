@@ -11,8 +11,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
-from .models import ScreenRequest
-from .screen import screen_primers
+from .models import ScreenRequest, SensitivityRequest
+from .screen import screen_primers, sensitivity_scan
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -121,6 +121,40 @@ def remove_job(job_id: str) -> dict:
     if not db.delete_job(job_id):
         raise HTTPException(status_code=404, detail="任务不存在或已被删除")
     return {"deleted": job_id}
+
+
+# ---------------------------------------------------------------------------
+# 条件敏感性分析（复用历史任务的同一批引物，盐浓度 × Tm 阈值逐格重算）
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/jobs/{job_id}/sensitivity")
+def post_sensitivity(job_id: str, payload: SensitivityRequest) -> dict:
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已被删除，无法执行敏感性分析")
+
+    # 理论上 Pydantic 的列表长度限制已保证 ≤ 64 格，这里保留显式 400 防线。
+    try:
+        payload.validate_grid()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    req = job["request"]
+    primers = [(p["id"], p["sequence"]) for p in req["primers"]]
+    analysis = sensitivity_scan(
+        primers,
+        salt_concs=payload.salt_concs,
+        temperatures=payload.temperatures,
+        min_bp=int(req.get("min_bp", 4)),
+        baseline_salt=float(req["salt_conc"]),
+        baseline_temp=float(req["temperature"]),
+    )
+    return {
+        "job_id": job_id,
+        "job_name": job["name"],
+        "sensitivity": analysis,
+    }
 
 
 @app.get("/healthz")

@@ -224,3 +224,145 @@ code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; b
 @media (max-width: 920px) {
   .layout { grid-template-columns: 1fr; }
 }
+
+/* ---------------- 条件敏感性分析 ---------------- */
+
+.sensitivity-box {
+  margin-top: 26px;
+  padding-top: 18px;
+  border-top: 1px dashed var(--border);
+}
+.sens-params {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 8px;
+}
+.sens-run { padding-bottom: 2px; }
+
+.sens-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+  margin: 12px 0 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.sens-legend .sw {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  margin-right: 4px;
+  vertical-align: -1px;
+}
+.sens-legend .sw-pass { background: rgba(77, 213, 153, .35); border: 1px solid var(--low); }
+.sens-legend .base-swatch { margin-left: auto; }
+.sens-first { margin: 6px 0; font-size: 13px; }
+.sens-first .safe-text { color: var(--low); }
+
+.heat-scroll { overflow-x: auto; margin-top: 10px; }
+.heatmap {
+  border-collapse: separate;
+  border-spacing: 4px;
+  margin: 0 auto;
+}
+.heatmap th {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 500;
+  padding: 2px 6px;
+  text-align: center;
+  white-space: nowrap;
+}
+.heatmap th.corner {
+  text-align: right;
+  vertical-align: middle;
+  max-width: 110px;
+}
+.heatmap th.rowhead {
+  text-align: right;
+  padding-right: 8px;
+  white-space: nowrap;
+  color: var(--text);
+  font-family: var(--mono);
+}
+.sens-cell {
+  position: relative;
+  min-width: 74px;
+  height: 56px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  text-align: center;
+  vertical-align: middle;
+  cursor: pointer;
+  transition: transform .1s, box-shadow .1s;
+  user-select: none;
+}
+.sens-cell:hover, .sens-cell:focus {
+  outline: none;
+  transform: scale(1.06);
+  box-shadow: 0 0 0 2px var(--accent);
+  z-index: 2;
+}
+.sens-cell.baseline { border: 2px solid var(--accent); }
+.sens-cell.first-crit { box-shadow: 0 0 0 2px var(--text); }
+.sens-cell.first-crit.baseline { box-shadow: 0 0 0 2px var(--text), 0 0 0 4px var(--accent); }
+.cell-num { font-size: 17px; font-weight: 700; display: block; line-height: 1.25; }
+.cell-crit {
+  display: inline-block;
+  font-size: 10.5px;
+  font-weight: 700;
+  margin: 0 3px;
+}
+.cell-discard { display: block; font-size: 10.5px; opacity: .92; }
+.first-star {
+  position: absolute;
+  top: -7px;
+  right: -5px;
+  font-size: 14px;
+  color: var(--text);
+  text-shadow: 0 0 4px #000;
+}
+
+.sens-detail {
+  margin-top: 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.sens-detail h4 { margin: 0 0 8px; font-size: 14px; display: flex; gap: 8px; align-items: center; }
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 6px 16px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.detail-grid b { color: var(--text); }
+.discard-line {
+  margin-top: 8px;
+  font-family: var(--mono);
+  font-size: 13px;
+  word-break: break-all;
+}
+.change-vs-base { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+.change-vs-base h5 { margin: 0 0 6px; font-size: 13px; }
+.change-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.change-col h5 { font-size: 12.5px; margin: 0 0 4px; }
+.change-col.up h5 { color: var(--critical); }
+.change-col.down h5 { color: var(--low); }
+.change-col ul { margin: 0; padding-left: 18px; max-height: 150px; overflow-y: auto; }
+.change-col li.mono { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+.discard-diff { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; font-size: 12.5px; }
+.discard-diff .up { color: var(--critical); }
+.discard-diff .down { color: var(--low); }
+
+@media (max-width: 700px) {
+  .sens-params { grid-template-columns: 1fr; }
+  .change-cols { grid-template-columns: 1fr; }
+  .sens-legend .base-swatch { margin-left: 0; flex-basis: 100%; }
+}

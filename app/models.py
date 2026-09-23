@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Literal
 
@@ -10,6 +11,10 @@ from pydantic import BaseModel, Field, field_validator
 from .screen import VALID_BASES, clean_sequence
 
 ID_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+
+# 敏感性分析：盐浓度 / Tm 阈值列表各自最多 8 项，组合不超过 64 格。
+MAX_SENSITIVITY_LIST = 8
+MAX_SENSITIVITY_CELLS = 64
 
 
 class PrimerIn(BaseModel):
@@ -65,3 +70,59 @@ class ScreenResponse(BaseModel):
 
 class ErrorResponse(BaseModel):
     detail: str
+
+
+def _validate_param_list(values: list[float], *, lo: float, hi: float, label: str) -> list[float]:
+    """校验敏感性分析的参数列表：长度、有限数值、取值范围。"""
+
+    if not values:
+        raise ValueError(f"{label}列表不能为空，至少提供 1 项，最多 {MAX_SENSITIVITY_LIST} 项")
+    if len(values) > MAX_SENSITIVITY_LIST:
+        raise ValueError(f"{label}列表最多 {MAX_SENSITIVITY_LIST} 项，当前为 {len(values)} 项")
+    cleaned: list[float] = []
+    for v in values:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{label}必须为数值，收到 {v!r}")
+        if not math.isfinite(f):
+            raise ValueError(f"{label}必须为有限数值，收到 {v!r}")
+        if not lo <= f <= hi:
+            raise ValueError(f"{label}需在 {lo}-{hi} 范围内，收到 {f}")
+        cleaned.append(f)
+    if len(set(cleaned)) != len(cleaned):
+        raise ValueError(f"{label}列表中存在重复值，请去重后再提交")
+    return cleaned
+
+
+class SensitivityRequest(BaseModel):
+    """条件敏感性分析请求：对历史任务复用同一批引物逐格重算。"""
+
+    salt_concs: list[float] = Field(
+        ...,
+        description="盐浓度列表（M Na+ 当量），1-8 项，每项 0.001-1.5，不可重复",
+    )
+    temperatures: list[float] = Field(
+        ...,
+        description="Tm 阈值列表（°C），1-8 项，每项 0-95，不可重复",
+    )
+
+    @field_validator("salt_concs")
+    @classmethod
+    def _check_salts(cls, v: list[float]) -> list[float]:
+        return _validate_param_list(v, lo=0.001, hi=1.5, label="盐浓度")
+
+    @field_validator("temperatures")
+    @classmethod
+    def _check_temps(cls, v: list[float]) -> list[float]:
+        return _validate_param_list(v, lo=0.0, hi=95.0, label="Tm 阈值")
+
+    def validate_grid(self) -> None:
+        """组合格数上限校验（放在路由中显式调用，以返回 400）。"""
+
+        cells = len(self.salt_concs) * len(self.temperatures)
+        if cells > MAX_SENSITIVITY_CELLS:
+            raise ValueError(
+                f"盐浓度 × Tm 阈值组合为 {cells} 格，超过上限 {MAX_SENSITIVITY_CELLS} 格"
+                f"（两个列表各不超过 {MAX_SENSITIVITY_LIST} 项）"
+            )

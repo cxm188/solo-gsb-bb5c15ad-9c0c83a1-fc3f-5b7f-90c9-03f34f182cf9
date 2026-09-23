@@ -702,3 +702,382 @@ def _dimer_to_dict(e: DimerEvent) -> dict:
         "recommendation": e.recommendation,
         "alignment": {"top_5to3": e.top, "pairs": e.middle, "bottom_3to5": e.bottom},
     }
+
+
+# ---------------------------------------------------------------------------
+# 条件敏感性分析
+# ---------------------------------------------------------------------------
+#
+# 配对几何（哪些位置互补、区间多长）只由序列与 min_bp 决定，**与盐浓度、
+# Tm 阈值无关**；变化的只是每个配对段的 Tm（盐校正）与风险分级。因此敏感性
+# 分析只做一次反对角线扫描，随后对每个（盐浓度 × Tm 阈值）格子复用同一批
+# 几何事件逐格重算 Tm / 风险。事件以「类型 + 引物 + 配对区间」为键，在所有
+# 格子之间天然对齐，可直接比较同一发卡/二聚体在不同条件下的风险变化。
+
+# 对齐事件明细最多返回的条数（聚合计数始终基于全部事件，不受此上限影响）。
+SENSITIVITY_EVENT_CAP = 400
+
+# 每格风险变化清单中，新增/消退事件键名最多列出的条数（另给准确计数）。
+SENSITIVITY_CHANGE_CAP = 50
+
+
+@dataclass
+class _GeoEvent:
+    """一个与条件无关的几何配对事件（算法内部使用）。"""
+
+    kind: str  # "hairpin" | "dimer"
+    key: str
+    involved: tuple  # hairpin: (pid,)；dimer: (id_a, id_b)
+    seg: Segment
+    tm_base: float
+    gc: int
+    edge: str | None  # 仅发卡
+    anchored: bool | None  # 仅二聚体
+    same: bool | None  # 仅二聚体
+
+
+def _hairpin_geo_key(pid: str, seg: Segment) -> str:
+    return f"hairpin|{pid}|{seg.a_start + 1}-{seg.a_end}|{seg.b_start + 1}-{seg.b_end}"
+
+
+def _dimer_geo_key(id_a: str, id_b: str, seg: Segment) -> str:
+    return (
+        f"dimer|{id_a}|{id_b}|"
+        f"{seg.a_start + 1}-{seg.a_end}|{seg.b_start + 1}-{seg.b_end}"
+    )
+
+
+def _collect_geometries(
+    primers: list[tuple[str, str]],
+    min_bp: int,
+) -> list[_GeoEvent]:
+    """扫描一次全部发卡 / 二聚体几何配对段（扫描规则与 screen_primers 一致）。"""
+
+    geos: list[_GeoEvent] = []
+
+    # 发卡：自身配对，强制最小环长，按区间去重。
+    for pid, seq in primers:
+        segs = scan_antiparallel(
+            seq, seq, min_bp=min_bp, min_loop=MIN_HAIRPIN_LOOP
+        )
+        seen: set[tuple] = set()
+        length = len(seq)
+        for seg in segs:
+            k = (seg.a_start, seg.a_end, seg.b_start, seg.b_end)
+            if k in seen:
+                continue
+            seen.add(k)
+            top = seq[seg.a_start : seg.a_end]
+            geos.append(
+                _GeoEvent(
+                    kind="hairpin",
+                    key=_hairpin_geo_key(pid, seg),
+                    involved=(pid,),
+                    seg=seg,
+                    tm_base=float(4 * _gc_count(top) + 2 * (len(top) - _gc_count(top))),
+                    gc=_gc_count(top),
+                    edge=_hairpin_edge(length, seg),
+                    anchored=None,
+                    same=None,
+                )
+            )
+
+    # 二聚体：自二聚体（无环长限制）+ 两两异源配对。
+    for idx, (id_a, seq_a) in enumerate(primers):
+        self_segs = scan_antiparallel(seq_a, seq_a, min_bp=min_bp)
+        seen_self: set[tuple] = set()
+        len_a = len(seq_a)
+        for seg in self_segs:
+            k = tuple(sorted(((seg.a_start, seg.a_end), (seg.b_start, seg.b_end))))
+            if k in seen_self:
+                continue
+            seen_self.add(k)
+            top = seq_a[seg.a_start : seg.a_end]
+            geos.append(
+                _GeoEvent(
+                    kind="dimer",
+                    key=_dimer_geo_key(id_a, id_a, seg),
+                    involved=(id_a, id_a),
+                    seg=seg,
+                    tm_base=float(4 * _gc_count(top) + 2 * (len(top) - _gc_count(top))),
+                    gc=_gc_count(top),
+                    edge=None,
+                    anchored=(seg.a_end == len_a and seg.b_end == len_a),
+                    same=True,
+                )
+            )
+        for id_b, seq_b in primers[idx + 1 :]:
+            segs = scan_antiparallel(seq_a, seq_b, min_bp=min_bp)
+            len_b = len(seq_b)
+            for seg in segs:
+                top = seq_a[seg.a_start : seg.a_end]
+                geos.append(
+                    _GeoEvent(
+                        kind="dimer",
+                        key=_dimer_geo_key(id_a, id_b, seg),
+                        involved=(id_a, id_b),
+                        seg=seg,
+                        tm_base=float(
+                            4 * _gc_count(top) + 2 * (len(top) - _gc_count(top))
+                        ),
+                        gc=_gc_count(top),
+                        edge=None,
+                        anchored=(seg.a_end == len_a and seg.b_end == len_b),
+                        same=False,
+                    )
+                )
+    return geos
+
+
+def _geo_risk(geo: _GeoEvent, tm: float, temperature: float) -> str:
+    if geo.kind == "hairpin":
+        return _hairpin_risk(geo.seg, tm, temperature, geo.edge)
+    return _dimer_risk(geo.seg, tm, temperature, geo.anchored)
+
+
+def _sensitivity_event_descriptor(
+    item: dict,
+    salts: list[float],
+) -> dict:
+    geo: _GeoEvent = item["geo"]
+    seg = geo.seg
+    first = item["first_critical"]
+    descriptor = {
+        "key": geo.key,
+        "type": geo.kind,
+        "bp": seg.length,
+        "matches": seg.matches,
+        "gc_pairs": geo.gc,
+        "tm_base": round(geo.tm_base, 2),
+        # 每个盐浓度一格的 Tm（Tm 只随盐浓度变化，不随 Tm 阈值变化）。
+        "tms": item["tms"],
+        # 风险矩阵：行对应 salt_concs（升序），列对应 temperatures（升序）。
+        "risk_grid": item["rows"],
+        "first_critical": (
+            {
+                "salt_index": first[0],
+                "temp_index": -first[1],
+                "salt_conc": salts[first[0]],
+                "temperature": None,  # 由调用方按索引补齐
+            }
+            if first is not None
+            else None
+        ),
+    }
+    if geo.kind == "hairpin":
+        descriptor.update(
+            {
+                "primer_id": geo.involved[0],
+                "arm_5prime": [seg.a_start + 1, seg.a_end],
+                "arm_3prime": [seg.b_start + 1, seg.b_end],
+                "at_edge": geo.edge,
+            }
+        )
+    else:
+        descriptor.update(
+            {
+                "primer_a": geo.involved[0],
+                "primer_b": geo.involved[1],
+                "same_primer": geo.same,
+                "interval_a": [seg.a_start + 1, seg.a_end],
+                "interval_b": [seg.b_start + 1, seg.b_end],
+                "anchored_three_prime": geo.anchored,
+            }
+        )
+    return descriptor
+
+
+def sensitivity_scan(
+    primers: list[tuple[str, str]],
+    *,
+    salt_concs: list[float],
+    temperatures: list[float],
+    min_bp: int = DEFAULT_MIN_BP,
+    baseline_salt: float,
+    baseline_temp: float,
+) -> dict:
+    """对同一批引物做（盐浓度 × Tm 阈值）条件敏感性分析。
+
+    输出包含：每个格子的高风险 / critical 数量、淘汰引物、相对任务原始
+    条件的风险变化，以及按「类型 + 引物 + 配对区间」对齐的事件风险矩阵。
+    """
+
+    salts = sorted(set(salt_concs))
+    temps = sorted(set(temperatures))
+    primer_ids = [pid for pid, _ in primers]
+
+    geos = _collect_geometries(primers, min_bp)
+
+    # 逐事件：几何只扫一次，Tm 只随盐浓度变，风险逐格判定。
+    items: list[dict] = []
+    for geo in geos:
+        tms = [
+            round(geo.tm_base + salt_correction(geo.seg.length, s), 2)
+            for s in salts
+        ]
+        rows: list[list[str]] = []
+        first = None  # (salt_index, -temp_index)：最小者即首次 critical
+        any_reported = False
+        for si, tm in enumerate(tms):
+            row: list[str] = []
+            for ti, t in enumerate(temps):
+                risk = _geo_risk(geo, tm, t)
+                row.append(risk)
+                if risk != "low":
+                    any_reported = True
+                if risk == "critical":
+                    cand = (si, -ti)
+                    if first is None or cand < first:
+                        first = cand
+            rows.append(row)
+
+        # 基线（任务原始条件）下非 low 的事件也保留，便于呈现「风险消退」。
+        base_tm = geo.tm_base + salt_correction(geo.seg.length, baseline_salt)
+        base_risk = _geo_risk(geo, base_tm, baseline_temp)
+        if any_reported or base_risk != "low":
+            items.append(
+                {
+                    "geo": geo,
+                    "tms": tms,
+                    "rows": rows,
+                    "first_critical": first,
+                    "base_risk": base_risk,
+                }
+            )
+
+    base_levels = {item["geo"].key: item["base_risk"] for item in items}
+    base_high = {k for k, r in base_levels.items() if r in ("high", "critical")}
+    base_discard = {
+        pid
+        for item in items
+        if item["base_risk"] in ("high", "critical")
+        for pid in item["geo"].involved
+    }
+
+    cells: list[dict] = []
+    first_critical_cell = None
+    for si, s in enumerate(salts):
+        for ti, t in enumerate(temps):
+            med_h = med_d = 0
+            high_h = high_d = 0
+            crit_h = crit_d = 0
+            reported = 0
+            primer_worst = {pid: 0 for pid in primer_ids}
+            high_now: set[str] = set()
+
+            for item in items:
+                risk = item["rows"][si][ti]
+                if risk == "low":
+                    continue
+                reported += 1
+                geo = item["geo"]
+                level = _RISK_ORDER[risk]
+                for pid in geo.involved:
+                    if level > primer_worst[pid]:
+                        primer_worst[pid] = level
+                if risk in ("high", "critical"):
+                    high_now.add(geo.key)
+                if geo.kind == "hairpin":
+                    if risk == "medium":
+                        med_h += 1
+                    elif risk == "high":
+                        high_h += 1
+                    else:
+                        crit_h += 1
+                else:
+                    if risk == "medium":
+                        med_d += 1
+                    elif risk == "high":
+                        high_d += 1
+                    else:
+                        crit_d += 1
+
+            discard = sorted(
+                pid for pid, lv in primer_worst.items() if lv >= _RISK_ORDER["high"]
+            )
+            discard_now = set(discard)
+            new_high = sorted(high_now - base_high)
+            resolved = sorted(base_high - high_now)
+
+            cell = {
+                "salt_index": si,
+                "temp_index": ti,
+                "salt_conc": s,
+                "temperature": t,
+                "is_baseline": s == baseline_salt and t == baseline_temp,
+                "events_reported": reported,
+                "medium_hairpins": med_h,
+                "medium_dimers": med_d,
+                "high_risk_hairpins": high_h,
+                "high_risk_dimers": high_d,
+                "critical_hairpins": crit_h,
+                "critical_dimers": crit_d,
+                "high_risk_total": high_h + high_d + crit_h + crit_d,
+                "critical_total": crit_h + crit_d,
+                "discard": discard,
+                "discard_count": len(discard),
+                "changes_vs_baseline": {
+                    "new_high": new_high[:SENSITIVITY_CHANGE_CAP],
+                    "new_high_count": len(new_high),
+                    "new_high_capped": len(new_high) > SENSITIVITY_CHANGE_CAP,
+                    "resolved": resolved[:SENSITIVITY_CHANGE_CAP],
+                    "resolved_count": len(resolved),
+                    "resolved_capped": len(resolved) > SENSITIVITY_CHANGE_CAP,
+                    "discard_added": sorted(discard_now - base_discard),
+                    "discard_removed": sorted(base_discard - discard_now),
+                },
+            }
+            cells.append(cell)
+
+            if crit_h + crit_d > 0:
+                cand = (si, -ti)
+                if first_critical_cell is None or cand < first_critical_cell[0]:
+                    first_critical_cell = (cand, cell)
+
+    # 对齐事件明细：按全网格最高风险、最高 Tm 排序后截断。
+    items_sorted = sorted(
+        items,
+        key=lambda it: (
+            -max(_RISK_ORDER[r] for row in it["rows"] for r in row),
+            -max(it["tms"]),
+            it["geo"].key,
+        ),
+    )
+    events_out: list[dict] = []
+    for item in items_sorted[:SENSITIVITY_EVENT_CAP]:
+        descriptor = _sensitivity_event_descriptor(item, salts)
+        if descriptor["first_critical"] is not None:
+            descriptor["first_critical"]["temperature"] = temps[
+                descriptor["first_critical"]["temp_index"]
+            ]
+        events_out.append(descriptor)
+
+    first_critical = None
+    if first_critical_cell is not None:
+        c = first_critical_cell[1]
+        first_critical = {
+            "salt_index": c["salt_index"],
+            "temp_index": c["temp_index"],
+            "salt_conc": c["salt_conc"],
+            "temperature": c["temperature"],
+            "critical_total": c["critical_total"],
+            "high_risk_total": c["high_risk_total"],
+        }
+
+    return {
+        "min_bp": min_bp,
+        "salt_concs": salts,
+        "temperatures": temps,
+        "baseline": {
+            "salt_conc": baseline_salt,
+            "temperature": baseline_temp,
+            "discard": sorted(base_discard),
+        },
+        "cell_count": len(cells),
+        "first_critical": first_critical,
+        "cells": cells,
+        "events": events_out,
+        "events_total": len(items),
+        "events_shown": len(events_out),
+        "events_capped": len(items) > SENSITIVITY_EVENT_CAP,
+    }

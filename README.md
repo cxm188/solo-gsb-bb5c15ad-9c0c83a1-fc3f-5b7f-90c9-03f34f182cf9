@@ -5,6 +5,11 @@
 按简化 Tm 阈值筛出高风险位点，返回 **可定位的配对区间**（1-based，5′→3′）
 与 **建议淘汰的引物/组合**。任务历史持久化到 SQLite，结果可一键导出 JSON。
 
+任务结果页还提供 **条件敏感性分析**：输入盐浓度与 Tm 阈值列表（各不超过 8
+项、组合不超过 64 格），后端 **复用同一批引物** 逐格重算发卡/二聚体风险，
+按事件类型、引物及配对区间对齐，以热力表标出 **首次达到 critical 的条件**，
+并提供每格分析 JSON 下载。
+
 技术栈：**FastAPI + SQLite + 原生 HTML/CSS/JS（零构建）**，Docker / Compose
 一键启动。
 
@@ -76,7 +81,10 @@ PCR_DB_PATH=./data/jobs.db uvicorn app.main:app --reload
 2. 设置 **盐浓度** 与 **退火温度（Tm 阈值）**；
 3. 点击 **「开始筛选」**；
 4. 查看概览卡片、建议淘汰清单、发卡/二聚体位点（含坐标与三行配对展示）；
-5. 点击 **「导出 JSON」** 下载完整结构化结果；历史任务可在页面底部重新载入或删除。
+5. 在结果页底部 **「条件敏感性分析」** 输入盐浓度与 Tm 阈值列表，点击
+   **「分析」** 查看热力表（★ 标出首次达到 critical 的条件），点击格子查看
+   淘汰引物与相对原始条件的风险变化，并可 **「下载分析 JSON」**；
+6. 点击 **「导出 JSON」** 下载完整结构化结果；历史任务可在页面底部重新载入或删除。
 
 ### 输入 JSON 格式
 
@@ -212,11 +220,125 @@ Tm      = Tm_base + 16.6·log10( f([Na⁺]) / f(0.05) )
 
 ---
 
+## 三·补、条件敏感性分析
+
+针对一个 **已保存的历史任务**，提供盐浓度与 Tm 阈值两个列表，后端复用该
+任务的 **同一批引物与 min_bp**，对每个（盐浓度 × Tm 阈值）格子重新计算
+发卡 / 二聚体风险。
+
+- **为什么可以复用**：哪些位置互补、配对区间多长只由序列决定；盐浓度只
+  影响 Tm，Tm 阈值只影响分级。配对几何只扫描一次，逐格重算 Tm 与风险；
+- **对齐方式**：每个事件以「类型（hairpin/dimer）+ 引物 + 配对区间」为
+  唯一键，全部格子共用同一组事件，可直接比较同一发卡/二聚体的风险变化；
+- **每格返回**：high / critical 数量（发卡、二聚体分列）、淘汰引物清单，
+  以及相对任务 **原始条件（baseline）** 的变化——新进入 / 跌出高风险的
+  事件、新增 / 解除淘汰的引物；
+- **首次 critical（★）**：从 **最低盐浓度** 行开始，行内自 **最高 Tm
+  阈值** 向左扫描，第一个出现 critical 事件的格子（即在最温和条件下仍
+  critical 的边界）。每条对齐事件也给出各自的首次 critical 坐标；
+- 前端以 **热力表** 展示（行=盐浓度升序、列=Tm 阈值升序），加粗边框为
+  baseline 格，点击任意格子查看详情。
+
+### 请求
+
+`POST /api/jobs/{job_id}/sensitivity`
+
+```json
+{
+  "salt_concs": [0.01, 0.05, 0.15, 0.5],
+  "temperatures": [20.0, 25.0, 30.0, 35.0, 40.0]
+}
+```
+
+两个列表均为 1–8 项、不可重复；盐浓度 0.001–1.5 M，Tm 阈值 0–95 °C；
+组合不超过 **64 格**（8×8）。仓库提供了可直接提交的
+[`examples/sensitivity_request.json`](examples/sensitivity_request.json)。
+
+```bash
+# 1) 先创建（或取一个已有）任务
+JOB=$(curl -s -X POST http://localhost:8000/api/screen \
+  -H 'Content-Type: application/json' \
+  -d @examples/sample_request.json | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
+
+# 2) 对该任务执行条件敏感性分析
+curl -s -X POST "http://localhost:8000/api/jobs/${JOB}/sensitivity" \
+  -H 'Content-Type: application/json' \
+  -d @examples/sensitivity_request.json | python3 -m json.tool
+```
+
+### 错误响应（4xx）
+
+| 状态码 | 触发条件 |
+| --- | --- |
+| `404` | `job_id` 不存在或已被删除 |
+| `400` | 盐浓度 × Tm 阈值组合超过 64 格 |
+| `422` | 列表为空 / 超过 8 项 / 含重复值或非数值 / 超出取值范围 / 请求体不是 JSON |
+
+### 响应结构（节选）
+
+```jsonc
+{
+  "job_id": "a02d91240a1b",
+  "sensitivity": {
+    "salt_concs": [0.01, 0.05, 0.15, 0.5],
+    "temperatures": [20.0, 25.0, 30.0, 35.0, 40.0],
+    "baseline": { "salt_conc": 0.05, "temperature": 25.0, "discard": ["..."] },
+    "cell_count": 20,
+    "first_critical": {
+      "salt_index": 0, "temp_index": 2,
+      "salt_conc": 0.01, "temperature": 30.0,
+      "critical_total": 4, "high_risk_total": 7
+    },
+    "cells": [
+      {
+        "salt_index": 0, "temp_index": 0, "salt_conc": 0.01, "temperature": 20.0,
+        "is_baseline": false,
+        "high_risk_hairpins": 0, "high_risk_dimers": 4,
+        "critical_hairpins": 0, "critical_dimers": 4,
+        "high_risk_total": 8, "critical_total": 4,
+        "medium_hairpins": 0, "medium_dimers": 1, "events_reported": 9,
+        "discard": ["Hairpin_F1", "Primer_F2", "Primer_R2"], "discard_count": 3,
+        "changes_vs_baseline": {
+          "new_high": [], "new_high_count": 0, "new_high_capped": false,
+          "resolved": ["dimer|Primer_F2|Primer_R2|20-30|1-11"],
+          "resolved_count": 1, "resolved_capped": false,
+          "discard_added": [], "discard_removed": []
+        }
+      }
+      // ... 共 20 格，顺序为 salt_concs 外层 × temperatures 内层（均升序）
+    ],
+    "events": [
+      {
+        "key": "dimer|Primer_F2|Primer_R2|17-30|17-30",
+        "type": "dimer", "primer_a": "Primer_F2", "primer_b": "Primer_R2",
+        "interval_a": [17, 30], "interval_b": [17, 30],
+        "anchored_three_prime": true, "bp": 14, "gc_pairs": 8, "tm_base": 44.0,
+        "tms": [36.5, 44.0, 48.2, 53.4],
+        "risk_grid": [["critical", "critical", "..."], ["..."]],
+        "first_critical": { "salt_index": 0, "temp_index": 2,
+                            "salt_conc": 0.01, "temperature": 30.0 }
+      }
+      // 按全网格最高风险排序；超过 400 条时仅保留最高风险的 400 条，
+      // 总数与是否截断见 events_total / events_shown / events_capped
+    ],
+    "events_total": 68, "events_shown": 68, "events_capped": false
+  }
+}
+```
+
+> 说明：`tms` 每个盐浓度一个值（Tm 不随 Tm 阈值变化）；`risk_grid` 为
+> `salt_concs × temperatures` 的风险等级矩阵。事件键格式：
+> `hairpin|引物|5′臂区间|3′臂区间`、
+> `dimer|引物A|引物B|区间A|区间B`（区间均为 1-based 闭区间）。
+
+---
+
 ## 四、HTTP API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/screen` | 提交引物与参数，执行筛选并落库 |
+| `POST` | `/api/jobs/{job_id}/sensitivity` | 对历史任务执行盐浓度 × Tm 阈值条件敏感性分析 |
 | `GET` | `/api/example` | 获取内置示例请求体 |
 | `GET` | `/api/jobs` | 历史任务列表（最近 50 条） |
 | `GET` | `/api/jobs/{job_id}` | 某任务的请求 + 完整结果 |
@@ -243,7 +365,9 @@ curl -s http://localhost:8000/api/example | curl -s -X POST http://localhost:800
 2. 沿对角线逐格判断互补，切出所有极大连续互补段（无 gap，结果可解释）；
 3. 发卡检测：链与自身配对，丢弃两臂重叠或环长 < 3 nt 的平凡自配对；
 4. 二聚体检测：自身（自二聚体，不要求环长）与两两异源配对，对称结果去重；
-5. 对每个互补段计算 Wallace + 盐校正 Tm，按上表分级并聚合成淘汰建议。
+5. 对每个互补段计算 Wallace + 盐校正 Tm，按上表分级并聚合成淘汰建议；
+6. 敏感性分析复用第 1–4 步的几何结果（配对几何只由序列与 `min_bp` 决定），
+   只对盐浓度/Tm 阈值逐格重算 Tm 与分级，因此事件按类型+引物+区间天然对齐。
 
 纯标准库实现，无 numpy/生物信息学重依赖；30 条约 20–28 nt 的引物全量
 （含所有两两组合）筛选约 0.4 秒。
