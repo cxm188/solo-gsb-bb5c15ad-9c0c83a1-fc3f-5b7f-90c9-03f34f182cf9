@@ -22,9 +22,17 @@ const els = {
   hairpins: $("#hairpinList"),
   dimers: $("#dimerList"),
   jobList: $("#jobList"),
+  sensSalts: $("#sensSalts"),
+  sensTms: $("#sensTms"),
+  sensRun: $("#btnSens"),
+  sensExport: $("#btnSensExport"),
+  sensMsg: $("#sensMsg"),
+  sensResult: $("#sensResult"),
 };
 
 let lastResponse = null; // { job_id, result }
+let currentJobId = null; // 当前结果所属任务（敏感性分析复用其引物）
+let lastSens = null; // 最近一次敏感性分析响应
 
 /* ---------------- 工具 ---------------- */
 
@@ -124,10 +132,12 @@ function renderDimer(e) {
 
 function renderResult(data) {
   lastResponse = data;
+  currentJobId = data.job_id;
   const r = data.result;
   els.empty.hidden = true;
   els.body.hidden = false;
   els.exportBtn.disabled = false;
+  resetSens(r);
 
   const cards = [
     [r.primer_count, "引物数量"],
@@ -247,6 +257,196 @@ function formatJson() {
   }
 }
 
+/* ---------------- 条件敏感性分析 ---------------- */
+
+const RISK_SHORT = { critical: "极", high: "高", medium: "中", low: "·" };
+
+/* 新结果渲染时重置敏感性区块，并按基准参数预填默认网格（不覆盖用户已填内容）。 */
+function resetSens(r) {
+  lastSens = null;
+  els.sensExport.disabled = true;
+  els.sensResult.innerHTML = "";
+  els.sensMsg.textContent = "";
+  els.sensMsg.className = "msg";
+  if (!els.sensSalts.value.trim()) {
+    const around = [r.salt_conc * 0.6, r.salt_conc, r.salt_conc * 1.5]
+      .map((x) => Math.min(1.5, Math.max(0.001, +x.toFixed(3))));
+    els.sensSalts.value = [...new Set(around)].join(", ");
+  }
+  if (!els.sensTms.value.trim()) {
+    const around = [r.temperature - 5, r.temperature, r.temperature + 5]
+      .map((x) => Math.min(95, Math.max(0, +x.toFixed(1))));
+    els.sensTms.value = [...new Set(around)].join(", ");
+  }
+}
+
+function setSensMsg(text, kind = "") {
+  els.sensMsg.textContent = text;
+  els.sensMsg.className = "msg" + (kind ? " " + kind : "");
+}
+
+function parseNumList(text, label) {
+  const parts = text.split(/[\s,，、;；]+/).filter(Boolean);
+  if (!parts.length) throw new Error(`请填写${label}`);
+  const nums = parts.map((p) => {
+    const x = Number(p);
+    if (!Number.isFinite(x)) throw new Error(`${label}含非法数值：${p}`);
+    return x;
+  });
+  if (nums.length > 8) throw new Error(`${label}最多 8 项（当前 ${nums.length} 项）`);
+  if (new Set(nums).size !== nums.length) throw new Error(`${label}存在重复值，请去重`);
+  return nums;
+}
+
+async function runSensitivity() {
+  if (!currentJobId) {
+    setSensMsg("请先执行筛选或载入历史任务", "err");
+    return;
+  }
+  let salts, tms;
+  try {
+    salts = parseNumList(els.sensSalts.value, "盐浓度列表");
+    tms = parseNumList(els.sensTms.value, "Tm 阈值列表");
+    if (salts.length * tms.length > 64) {
+      throw new Error(`组合共 ${salts.length * tms.length} 格，超过上限 64 格`);
+    }
+  } catch (e) {
+    setSensMsg(e.message, "err");
+    return;
+  }
+  els.sensRun.disabled = true;
+  setSensMsg("分析中…");
+  try {
+    const resp = await fetch(`/api/jobs/${currentJobId}/sensitivity`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ salt_concs: salts, tm_thresholds: tms }),
+    });
+    const body = await resp.json();
+    if (!resp.ok) {
+      const detail = typeof body.detail === "string"
+        ? body.detail
+        : (body.detail || []).map((d) => d.msg).join("；");
+      setSensMsg(`请求失败（${resp.status}）：${detail || "参数非法"}`, "err");
+      return;
+    }
+    lastSens = body;
+    els.sensExport.disabled = false;
+    setSensMsg(`完成 ✓ ${body.cells.length} 格 × ${body.events_considered} 个对齐事件`, "ok");
+    renderSensitivity(body);
+  } catch (e) {
+    setSensMsg("网络错误：" + e.message, "err");
+  } finally {
+    els.sensRun.disabled = false;
+  }
+}
+
+/* 高风险数 → 热力色（绿→黄→红）。 */
+function heatColor(ratio) {
+  const hue = 140 - 140 * Math.min(1, ratio);
+  return `hsl(${hue}, 65%, 32%)`;
+}
+
+function locusText(ev) {
+  const L = ev.locus;
+  if (ev.type === "hairpin") {
+    return `${L.primer_id} 5′臂${L.arm_5prime[0]}–${L.arm_5prime[1]} × 3′臂${L.arm_3prime[0]}–${L.arm_3prime[1]}`;
+  }
+  return `${L.primer_a} ${L.interval_a[0]}–${L.interval_a[1]} × ${L.primer_b} ${L.interval_b[0]}–${L.interval_b[1]}`;
+}
+
+function renderSensitivity(data) {
+  const nT = data.tm_thresholds.length;
+  const maxHigh = Math.max(1, ...data.cells.map((c) => c.high_risk_total));
+
+  let html = `<div class="sens-summary">
+    基准条件：[Na⁺] <b>${data.base.salt_conc} M</b> · Tm 阈值 <b>${data.base.temperature}°C</b> · min_bp <b>${data.base.min_bp}</b>；
+    共 <b>${data.cells.length}</b> 格，对齐事件 <b>${data.events_considered}</b> 个` +
+    (data.events_capped ? `（另有 ${data.events_capped} 个事件超出上限未纳入）` : "") +
+    `。点击格子查看淘汰引物与风险变化。</div>`;
+
+  html += `<div class="heat-wrap"><table class="heat"><thead><tr><th>[Na⁺] ＼ Tm</th>` +
+    data.tm_thresholds.map((t) => `<th>${t}°C</th>`).join("") + `</tr></thead><tbody>`;
+  data.salt_concs.forEach((s, ri) => {
+    html += `<tr><th>${s} M</th>`;
+    data.tm_thresholds.forEach((t, ci) => {
+      const idx = ri * nT + ci;
+      const c = data.cells[idx];
+      const star = c.first_critical_events
+        ? `<span class="star" title="${c.first_critical_events} 个事件在此格首次达到 critical">★${c.first_critical_events}</span>`
+        : "";
+      html += `<td class="hcell${c.is_base ? " base" : ""}" data-cell="${idx}"
+        style="background:${heatColor(c.high_risk_total / maxHigh)}"
+        title="高风险 ${c.high_risk_total}（critical ${c.critical_events}）· 淘汰 ${c.discard.length}">
+        <div class="hnum">${c.high_risk_total}</div>
+        <div class="hsub">极${c.critical_events} 淘${c.discard.length}</div>${star}</td>`;
+    });
+    html += `</tr>`;
+  });
+  html += `</tbody></table></div><div id="sensCellDetail" class="sens-detail"></div>`;
+
+  // 事件对齐矩阵（折叠，最多展示前 150 行）
+  const MAX_ROWS = 150;
+  const rows = data.events.slice(0, MAX_ROWS);
+  html += `<details class="sens-matrix"><summary>事件对齐矩阵（${data.events.length} 个事件 × ${data.cells.length} 格，按最严苛条件排序` +
+    (data.events.length > MAX_ROWS ? `，仅显示前 ${MAX_ROWS} 行` : "") + `）</summary>`;
+  html += `<div class="heat-wrap"><table class="heat matrix"><thead><tr><th>事件（类型 · 引物 · 配对区间）</th>` +
+    data.cells.map((c) => `<th>${c.salt_conc}M<br>${c.tm_threshold}°C</th>`).join("") +
+    `<th>基准</th></tr></thead><tbody>`;
+  rows.forEach((ev) => {
+    const icon = ev.type === "hairpin" ? "🔻" : "🔗";
+    html += `<tr><td class="mlabel" title="${esc(ev.key)}">${icon} ${esc(locusText(ev))}</td>`;
+    ev.cell_risks.forEach((risk, i) => {
+      const star = ev.first_critical_cell === i ? `<span class="star in-cell">★</span>` : "";
+      html += `<td class="rcell ${risk}">${RISK_SHORT[risk]}${star}</td>`;
+    });
+    html += `<td class="rcell ${ev.base_risk} basecol">${RISK_SHORT[ev.base_risk]}</td></tr>`;
+  });
+  html += `</tbody></table></div></details>`;
+
+  els.sensResult.innerHTML = html;
+  els.sensResult.querySelectorAll(".hcell").forEach((td) =>
+    td.addEventListener("click", () => showCellDetail(data, +td.dataset.cell)));
+}
+
+function showCellDetail(data, idx) {
+  const c = data.cells[idx];
+  const d = c.delta;
+  const sign = (n) => (n > 0 ? `+${n}` : `${n}`);
+  const parts = [];
+  if (d.events_upgraded) parts.push(`升级 ${d.events_upgraded}`);
+  if (d.events_downgraded) parts.push(`降级 ${d.events_downgraded}`);
+  if (d.events_new) parts.push(`新出现 ${d.events_new}`);
+  if (d.events_gone) parts.push(`消失 ${d.events_gone}`);
+  const deltaEvents = parts.length ? parts.join(" · ") : "事件风险无变化";
+  const discardHtml = c.discard.length
+    ? `<span class="badge high">淘汰 ${c.discard.length}</span> ${c.discard.map(esc).join("，")}`
+    : `<span class="badge low">无淘汰</span>`;
+  const added = d.discard_added.length ? `新增淘汰：${d.discard_added.map(esc).join("，")}` : "";
+  const removed = d.discard_removed.length ? `解除淘汰：${d.discard_removed.map(esc).join("，")}` : "";
+
+  document.getElementById("sensCellDetail").innerHTML = `
+    <h4>条件格：[Na⁺] ${c.salt_conc} M × Tm 阈值 ${c.tm_threshold}°C${c.is_base ? ' <span class="badge tag">基准条件</span>' : ""}</h4>
+    <div class="sens-detail-grid">
+      <span>高风险事件 <b>${c.high_risk_total}</b>（发卡 ${c.high_risk_hairpins} / 二聚体 ${c.high_risk_dimers}，critical ${c.critical_events}，相对基准 ${sign(d.high_risk_total)}）</span>
+      <span>相对基准：${esc(deltaEvents)}</span>
+      <span>${discardHtml}</span>
+      ${added ? `<span>➕ ${added}</span>` : ""}
+      ${removed ? `<span>➖ ${removed}</span>` : ""}
+      ${c.first_critical_events ? `<span>★ ${c.first_critical_events} 个事件在本格首次达到 critical</span>` : ""}
+    </div>`;
+}
+
+function exportSensJson() {
+  if (!lastSens) return;
+  const blob = new Blob([JSON.stringify(lastSens, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `primer-sensitivity-${lastSens.job_id}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 /* ---------------- 历史任务 ---------------- */
 
 async function loadJobs() {
@@ -312,5 +512,7 @@ els.exportBtn.addEventListener("click", exportJson);
 els.example.addEventListener("click", loadExample);
 els.format.addEventListener("click", formatJson);
 els.refreshJobs.addEventListener("click", loadJobs);
+els.sensRun.addEventListener("click", runSensitivity);
+els.sensExport.addEventListener("click", exportSensJson);
 
 loadJobs();

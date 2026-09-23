@@ -11,8 +11,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import db
-from .models import ScreenRequest
-from .screen import screen_primers
+from .models import ScreenRequest, SensitivityRequest
+from .screen import DEFAULT_MIN_BP, clean_sequence, screen_primers
+from .sensitivity import run_sensitivity
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -121,6 +122,44 @@ def remove_job(job_id: str) -> dict:
     if not db.delete_job(job_id):
         raise HTTPException(status_code=404, detail="任务不存在或已被删除")
     return {"deleted": job_id}
+
+
+# ---------------------------------------------------------------------------
+# 条件敏感性分析
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/jobs/{job_id}/sensitivity")
+def post_sensitivity(job_id: str, payload: SensitivityRequest) -> dict:
+    """复用历史任务的引物，在「盐浓度 × Tm 阈值」网格上逐格重算风险。
+
+    返回每格的高风险数量、淘汰引物与相对基准条件（原任务参数）的风险变化，
+    事件按「类型 + 引物 + 配对区间」对齐，并标出每个事件首次达到 critical
+    的条件格。
+    """
+
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已被删除")
+
+    req = job["request"]
+    primers = [
+        (p["id"], clean_sequence(p["sequence"])) for p in req.get("primers", [])
+    ]
+    if not primers:
+        raise HTTPException(status_code=422, detail="该任务记录中不含可用引物，无法分析")
+
+    result = run_sensitivity(
+        primers,
+        salt_concs=payload.salt_concs,
+        tm_thresholds=payload.tm_thresholds,
+        min_bp=req.get("min_bp", DEFAULT_MIN_BP),
+        base_salt=req["salt_conc"],
+        base_temp=req["temperature"],
+    )
+    result["job_id"] = job_id
+    result["job_name"] = job["name"]
+    return result
 
 
 @app.get("/healthz")

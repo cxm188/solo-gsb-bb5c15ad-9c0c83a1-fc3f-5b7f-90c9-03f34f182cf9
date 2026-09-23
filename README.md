@@ -77,6 +77,11 @@ PCR_DB_PATH=./data/jobs.db uvicorn app.main:app --reload
 3. 点击 **「开始筛选」**；
 4. 查看概览卡片、建议淘汰清单、发卡/二聚体位点（含坐标与三行配对展示）；
 5. 点击 **「导出 JSON」** 下载完整结构化结果；历史任务可在页面底部重新载入或删除。
+6. （可选）在结果页底部的 **「条件敏感性分析」** 中输入盐浓度列表与 Tm 阈值
+   列表（各 ≤8 项、组合 ≤64 格），点击「运行敏感性分析」：后端复用当前任务的
+   引物逐格重算风险，页面以 **热力表** 展示每格高风险数量，★ 标出有事件
+   **首次达到 critical** 的条件格，蓝框为基准条件（原任务参数）；点击任意格子
+   可查看该格的淘汰引物与相对基准的风险变化，「下载 JSON」可导出完整网格结果。
 
 ### 输入 JSON 格式
 
@@ -217,6 +222,7 @@ Tm      = Tm_base + 16.6·log10( f([Na⁺]) / f(0.05) )
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/screen` | 提交引物与参数，执行筛选并落库 |
+| `POST` | `/api/jobs/{job_id}/sensitivity` | 条件敏感性分析：复用该任务的引物，在「盐浓度 × Tm 阈值」网格上逐格重算风险 |
 | `GET` | `/api/example` | 获取内置示例请求体 |
 | `GET` | `/api/jobs` | 历史任务列表（最近 50 条） |
 | `GET` | `/api/jobs/{job_id}` | 某任务的请求 + 完整结果 |
@@ -230,6 +236,89 @@ Tm      = Tm_base + 16.6·log10( f([Na⁺]) / f(0.05) )
 curl -s http://localhost:8000/api/example | curl -s -X POST http://localhost:8000/api/screen \
   -H 'Content-Type: application/json' -d @- | python3 -m json.tool
 ```
+
+### 条件敏感性分析
+
+对某个历史任务（`/api/screen` 返回的 `job_id`）执行：
+
+```bash
+JOB_ID=$(curl -s -X POST http://localhost:8000/api/screen \
+  -H 'Content-Type: application/json' -d @examples/sample_request.json \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
+
+curl -s -X POST "http://localhost:8000/api/jobs/${JOB_ID}/sensitivity" \
+  -H 'Content-Type: application/json' \
+  -d '{"salt_concs": [0.03, 0.05, 0.1], "tm_thresholds": [20.0, 25.0, 30.0]}' \
+  | python3 -m json.tool
+```
+
+请求体：
+
+| 字段 | 约束 |
+| --- | --- |
+| `salt_concs` | 1–8 项，每项 0.001–1.5 M，不得重复 |
+| `tm_thresholds` | 1–8 项，每项 0–95 °C，不得重复 |
+| 组合上限 | 两轴乘积 ≤ 64 格 |
+
+要点：
+
+- **复用同一批引物**：配对区间只与序列和 `min_bp` 有关，后端先扫描一次事件
+  骨架，再逐格重算 Tm（盐校正）与风险等级（阈值比较），网格计算不重复扫描；
+- **事件对齐**：每个事件以「类型 + 引物 + 配对区间」为键（如
+  `hairpin|Hairpin_F1|1-14|18-31`），`events[].cell_risks` 与 `cells` 同序，
+  可跨格追踪同一事件的风险变化；
+- **基准条件**：原任务的 `salt_conc` / `temperature`，每格 `delta` 均相对它计算
+  （高风险数变化、新增/解除淘汰、事件升级/降级/新出现/消失）；
+- **首次 critical**：`events[].first_critical_cell` 给出该事件首次达到 critical
+  的格子索引（取最温和的临界条件：阈值最高者优先，并列时盐浓度最低者），
+  每格 `first_critical_events` 为对应计数，前端以 ★ 标注；
+- 进入对齐矩阵的事件上限为 500 个（按最严苛格风险排序），超出部分计入
+  `events_capped`；在所有格均为 low 的背景事件不进入矩阵。
+
+响应节选：
+
+```jsonc
+{
+  "job_id": "a02d91240a1b",
+  "base": { "salt_conc": 0.05, "temperature": 25.0, "min_bp": 4 },
+  "salt_concs": [0.03, 0.05, 0.1],
+  "tm_thresholds": [20.0, 25.0, 30.0],
+  "events_considered": 33,
+  "events_capped": 0,
+  "cells": [
+    {
+      "salt_conc": 0.05, "tm_threshold": 25.0, "is_base": true,
+      "high_risk_hairpins": 1, "high_risk_dimers": 8, "high_risk_total": 9,
+      "critical_events": 4,
+      "discard": ["Hairpin_F1", "Primer_F2", "Primer_R2"],
+      "first_critical_events": 0,
+      "delta": { "high_risk_total": 0, "discard_added": [], "discard_removed": [],
+                 "events_new": 0, "events_gone": 0,
+                 "events_upgraded": 0, "events_downgraded": 0 }
+    }
+  ],
+  "events": [
+    {
+      "key": "dimer|Primer_F2|Primer_F2|17-30|17-30",
+      "type": "dimer",
+      "primers": ["Primer_F2", "Primer_F2"],
+      "locus": { "primer_a": "Primer_F2", "interval_a": [17, 30], "...": "..." },
+      "bp": 14, "tm_base": 44.0,
+      "base_risk": "critical",
+      "cell_risks": ["critical", "critical", "..."],
+      "first_critical_cell": 2
+    }
+  ]
+}
+```
+
+错误返回（均为 4xx + 明确 `detail`）：
+
+| 情形 | 状态码 |
+| --- | --- |
+| 任务不存在 | `404` |
+| 列表为空 / 超过 8 项 / 数值越界 / 含重复值 / 非数值 | `422` |
+| 组合超过 64 格 | `422` |
 
 ---
 
@@ -254,7 +343,8 @@ curl -s http://localhost:8000/api/example | curl -s -X POST http://localhost:800
 .
 ├── app/
 │   ├── main.py          # FastAPI 路由 + 静态托管
-│   ├── screen.py        # 核心：反对角线扫描、发卡/二聚体、Tm、分级
+│   ├── screen.py        # 核心：反对角线扫描、发卡/二聚体、Tm、分级、事件骨架
+│   ├── sensitivity.py   # 条件敏感性分析：网格重算、事件对齐、风险变化
 │   ├── models.py        # Pydantic 请求模型与输入校验
 │   ├── db.py            # SQLite 任务历史
 │   └── static/          # 原生前端 index.html / styles.css / app.js

@@ -351,24 +351,24 @@ _RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 MEDIUM_TM_MARGIN = 5.0
 
 
-def _hairpin_risk(seg: Segment, tm: float, temp: float, edge: str) -> str:
+def _hairpin_risk(matches: int, tm: float, temp: float, edge: str) -> str:
     if edge == "3-prime" and tm >= temp:
         return "critical"
     if tm >= temp:
         return "high"
     if tm >= temp - MEDIUM_TM_MARGIN:
-        return "medium" if edge != "internal" or seg.matches >= 8 else "low"
+        return "medium" if edge != "internal" or matches >= 8 else "low"
     return "low"
 
 
-def _dimer_risk(seg: Segment, tm: float, temp: float, anchored: bool) -> str:
+def _dimer_risk(matches: int, tm: float, temp: float, anchored: bool) -> str:
     if anchored and tm >= temp:
         return "critical"
     if tm >= temp:
         return "high"
     if tm >= temp - MEDIUM_TM_MARGIN:
         # 接近阈值但未锚定 3' 端的短互补段，降为背景低风险。
-        return "medium" if seg.matches >= 8 else "low"
+        return "medium" if matches >= 8 else "low"
     return "low"
 
 
@@ -439,7 +439,7 @@ def _segments_to_hairpins(
         top, middle, bottom = alignment_strings(seq, seq, seg)
         tm_base, tm = simplified_tm(top, salt_conc)
         edge = _hairpin_edge(length, seg)
-        risk = _hairpin_risk(seg, tm, temperature, edge)
+        risk = _hairpin_risk(seg.matches, tm, temperature, edge)
         events.append(
             HairpinEvent(
                 primer_id=primer_id,
@@ -487,7 +487,7 @@ def _segments_to_dimers(
         a_3p = seg.a_end == len_a
         b_3p = seg.b_end == len_b
         anchored = a_3p and b_3p
-        risk = _dimer_risk(seg, tm, temperature, anchored)
+        risk = _dimer_risk(seg.matches, tm, temperature, anchored)
         events.append(
             DimerEvent(
                 primer_a=id_a,
@@ -511,6 +511,142 @@ def _segments_to_dimers(
             )
         )
     return events
+
+
+# ---------------------------------------------------------------------------
+# 事件骨架（与盐浓度/温度无关，供条件敏感性分析复用）
+# ---------------------------------------------------------------------------
+#
+# 配对段的位置、bp、GC、3' 锚定等属性只取决于序列与 min_bp；盐浓度只影响
+# Tm 的盐校正项，温度只影响风险分级。因此可以先扫描一次事件骨架，再在
+# 「盐浓度 × Tm 阈值」网格上逐格重算 Tm 与风险，避免重复扫描。
+
+
+@dataclass
+class RawEvent:
+    """一个局部互补事件的骨架（0 依赖盐浓度/温度的部分）。"""
+
+    type: str  # "hairpin" | "dimer"
+    key: str  # 跨条件对齐键：类型 + 引物 + 1-based 配对区间
+    primer_ids: list  # 涉及的引物 id（二聚体为两条）
+    tm_base: float  # Wallace 基础 Tm（与盐无关）
+    seq_len: int  # 配对段长度（盐校正用）
+    matches: int
+    bp: int
+    edge: str  # 发卡："3-prime" / "5-prime" / "internal"；二聚体为 ""
+    anchored: bool  # 二聚体：3' 锚定；发卡为 False
+    locus: dict  # 1-based 区间描述（展示/对齐用）
+
+
+def _raw_event_common(seq_a: str, seg: Segment) -> tuple[float, int]:
+    """从 A 侧配对段序列算出 (tm_base, seq_len)，与 simplified_tm 保持一致。"""
+
+    top = seq_a[seg.a_start : seg.a_end]
+    gc = _gc_count(top)
+    at = len(top) - gc
+    return 4.0 * gc + 2.0 * at, len(top)
+
+
+def collect_raw_events(
+    primers: list[tuple[str, str]],
+    *,
+    min_bp: int = DEFAULT_MIN_BP,
+) -> list[RawEvent]:
+    """扫描一批引物的全部发卡/二聚体事件骨架（不做风险过滤）。"""
+
+    events: list[RawEvent] = []
+
+    # 1) 发卡：与 screen_primers 相同的扫描与去重规则。
+    for pid, seq in primers:
+        segs = scan_antiparallel(seq, seq, min_bp=min_bp, min_loop=MIN_HAIRPIN_LOOP)
+        seen: set[tuple] = set()
+        length = len(seq)
+        for seg in segs:
+            dedup = (seg.a_start, seg.a_end, seg.b_start, seg.b_end)
+            if dedup in seen:
+                continue
+            seen.add(dedup)
+            tm_base, seq_len = _raw_event_common(seq, seg)
+            edge = _hairpin_edge(length, seg)
+            events.append(
+                RawEvent(
+                    type="hairpin",
+                    key=f"hairpin|{pid}|{seg.a_start + 1}-{seg.a_end}|{seg.b_start + 1}-{seg.b_end}",
+                    primer_ids=[pid],
+                    tm_base=tm_base,
+                    seq_len=seq_len,
+                    matches=seg.matches,
+                    bp=seg.length,
+                    edge=edge,
+                    anchored=False,
+                    locus={
+                        "primer_id": pid,
+                        "arm_5prime": [seg.a_start + 1, seg.a_end],
+                        "arm_3prime": [seg.b_start + 1, seg.b_end],
+                        "loop_length": seg.b_start - seg.a_end,
+                        "at_edge": edge,
+                    },
+                )
+            )
+
+    # 2) 二聚体：自二聚体（无环长限制）+ 两两异源配对。
+    for idx, (pid_a, seq_a) in enumerate(primers):
+        pair_list = [(pid_a, seq_a)] + list(primers[idx + 1 :])
+        for pid_b, seq_b in pair_list:
+            same = pid_a == pid_b
+            segs = scan_antiparallel(seq_a, seq_b, min_bp=min_bp)
+            seen_pair: set[tuple] = set()
+            for seg in segs:
+                if same:
+                    dedup = tuple(sorted(((seg.a_start, seg.a_end), (seg.b_start, seg.b_end))))
+                    if dedup in seen_pair:
+                        continue
+                    seen_pair.add(dedup)
+                tm_base, seq_len = _raw_event_common(seq_a, seg)
+                a_3p = seg.a_end == len(seq_a)
+                b_3p = seg.b_end == len(seq_b)
+                anchored = a_3p and b_3p
+                events.append(
+                    RawEvent(
+                        type="dimer",
+                        key=(
+                            f"dimer|{pid_a}|{pid_b}|"
+                            f"{seg.a_start + 1}-{seg.a_end}|{seg.b_start + 1}-{seg.b_end}"
+                        ),
+                        primer_ids=[pid_a, pid_b],
+                        tm_base=tm_base,
+                        seq_len=seq_len,
+                        matches=seg.matches,
+                        bp=seg.length,
+                        edge="",
+                        anchored=anchored,
+                        locus={
+                            "primer_a": pid_a,
+                            "primer_b": pid_b,
+                            "same_primer": same,
+                            "interval_a": [seg.a_start + 1, seg.a_end],
+                            "interval_b": [seg.b_start + 1, seg.b_end],
+                            "anchored_three_prime": anchored,
+                        },
+                    )
+                )
+    return events
+
+
+def evaluate_raw_event(
+    ev: RawEvent,
+    *,
+    salt_conc: float,
+    temperature: float,
+) -> tuple[float, str]:
+    """在给定盐浓度与 Tm 阈值下重算一个事件骨架的 (tm, risk)。"""
+
+    tm = ev.tm_base + salt_correction(ev.seq_len, salt_conc)
+    if ev.type == "hairpin":
+        risk = _hairpin_risk(ev.matches, tm, temperature, ev.edge)
+    else:
+        risk = _dimer_risk(ev.matches, tm, temperature, ev.anchored)
+    return round(tm, 2), risk
 
 
 # ---------------------------------------------------------------------------

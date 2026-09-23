@@ -83,6 +83,27 @@
 
         <h3>🔗 引物二聚体（Dimer）</h3>
         <div id="dimerList" class="event-list"></div>
+
+        <h3>🌡️ 条件敏感性分析（盐浓度 × Tm 阈值）</h3>
+        <div class="sens-box">
+          <div class="sens-controls">
+            <div class="sens-field">
+              <label class="field-label" for="sensSalts">盐浓度列表 [Na⁺]（M，≤8 项，逗号分隔）</label>
+              <input id="sensSalts" type="text" spellcheck="false" placeholder="0.03, 0.05, 0.1" />
+            </div>
+            <div class="sens-field">
+              <label class="field-label" for="sensTms">Tm 阈值列表（°C，≤8 项）</label>
+              <input id="sensTms" type="text" spellcheck="false" placeholder="20, 25, 30" />
+            </div>
+            <div class="sens-actions">
+              <button id="btnSens" class="btn primary" type="button">▶ 运行敏感性分析</button>
+              <button id="btnSensExport" class="btn ghost" type="button" disabled>⬇ 下载 JSON</button>
+            </div>
+          </div>
+          <p class="hint">复用当前任务的引物，逐格重算发卡/二聚体风险；组合上限 8×8=64 格。★ 表示有事件在该格首次达到 critical，蓝框为基准条件（原任务参数）。</p>
+          <div id="sensMsg" class="msg"></div>
+          <div id="sensResult"></div>
+        </div>
       </div>
     </section>
   </main>

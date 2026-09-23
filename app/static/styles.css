@@ -221,6 +221,94 @@ code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; b
   text-align: center;
 }
 
+/* ---------------- 条件敏感性分析 ---------------- */
+
+.sens-box {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.sens-controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 10px;
+  align-items: end;
+}
+.sens-field .field-label { margin-top: 0; }
+.sens-actions { display: flex; gap: 8px; padding-bottom: 1px; }
+.sens-box .msg { display: inline-block; margin-top: 8px; }
+
+.sens-summary { color: var(--muted); font-size: 12.5px; margin: 10px 0 8px; }
+.sens-summary b { color: var(--text); }
+
+.heat-wrap { overflow-x: auto; }
+.heat {
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 100%;
+}
+.heat th, .heat td {
+  border: 1px solid var(--border);
+  padding: 4px 6px;
+  text-align: center;
+}
+.heat thead th { background: var(--panel); color: var(--muted); font-weight: 600; white-space: nowrap; }
+.heat tbody th { background: var(--panel); color: var(--muted); font-weight: 600; white-space: nowrap; text-align: right; }
+
+.hcell { cursor: pointer; position: relative; min-width: 64px; color: #fff; }
+.hcell:hover { outline: 2px solid var(--accent); outline-offset: -2px; }
+.hcell.base { outline: 2px solid var(--accent); outline-offset: -2px; }
+.hcell .hnum { font-size: 16px; font-weight: 700; line-height: 1.2; }
+.hcell .hsub { font-size: 10.5px; opacity: .85; }
+.hcell .star {
+  position: absolute;
+  top: 1px;
+  right: 3px;
+  font-size: 11px;
+  color: #ffe08a;
+  text-shadow: 0 0 3px #000;
+}
+
+.sens-detail { margin-top: 10px; }
+.sens-detail:empty { display: none; }
+.sens-detail h4 { margin: 0 0 6px; font-size: 13.5px; }
+.sens-detail-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12.5px;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.sens-detail-grid b { color: var(--text); }
+
+.sens-matrix { margin-top: 12px; }
+.sens-matrix summary { cursor: pointer; color: var(--accent); font-size: 13px; margin-bottom: 8px; }
+.heat.matrix td.mlabel {
+  text-align: left;
+  white-space: nowrap;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+.rcell { min-width: 44px; font-weight: 700; position: relative; }
+.rcell.critical { background: rgba(255, 92, 122, .35); color: #ffb3c2; }
+.rcell.high { background: rgba(255, 159, 67, .28); color: #ffcf9e; }
+.rcell.medium { background: rgba(255, 209, 102, .18); color: #ffe08a; }
+.rcell.low { color: var(--muted); }
+.rcell.basecol { border-left: 2px solid var(--accent); }
+.rcell .star.in-cell { position: absolute; top: 0; right: 2px; font-size: 9px; color: #ffe08a; }
+
+@media (max-width: 920px) {
+  .sens-controls { grid-template-columns: 1fr; }
+}
+
 @media (max-width: 920px) {
   .layout { grid-template-columns: 1fr; }
 }
